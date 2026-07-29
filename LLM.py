@@ -1,45 +1,32 @@
 """
-Dr. MedAssist — LangChain/LangGraph ReAct Agent
-=================================================
-A medical-assisting conversational agent built on LangGraph's prebuilt
-ReAct architecture. The agent has access to three tools: a time lookup,
-a safe numeric calculator (for dosage/unit calculations), and a live
-web search (for up-to-date medical information).
-
-Session state (conversation history) is persisted in-memory per thread_id
-using LangGraph's InMemorySaver checkpointer — no external database
-required. Note: state is lost when the process exits; for production use,
-swap InMemorySaver for a persistent checkpointer (e.g. SqliteSaver).
+Dr. MedAssist — MCP Server
 """
 
 import os
+import sys
+import time
+from datetime import datetime
 from dotenv import load_dotenv
+
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain_community.tools import DuckDuckGoSearchRun  # pip install duckduckgo-search
+from langchain_tavily import TavilySearch
+from mcp.server.fastmcp import FastMCP
 
-# Load environment variables (expects OPENROUTER_API_KEY in a .env file)
 load_dotenv()
 
 # ---------------------------------------------------------
-# STEP 1: Model Setup (via OpenRouter)
+# Logging helper — write diagnostics to stderr (stdout is reserved)
 # ---------------------------------------------------------
-# Using Meta's Llama 3.3 70B Instruct model through the OpenRouter API,
-# which exposes an OpenAI-compatible interface.
-#
-# Tuned parameters explained:
-# - temperature=0.3 : Lower = more consistent/deterministic answers.
-#   Important for medical info — we don't want dosage numbers changing
-#   randomly between runs of the same question.
-# - max_tokens=500  : Caps response length. High enough that dosage +
-#   safety warnings + disclaimer aren't cut off mid-sentence, but not
-#   so high that responses ramble or cost/latency balloon.
-# - timeout=25      : Max seconds to wait for a model/API response
-#   before raising an error, instead of hanging indefinitely.
-# - max_retries=2   : Automatically retries failed API calls (e.g.
-#   transient network issues) before giving up.
+def log(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+# ---------------------------------------------------------
+# STEP 1: Model Setup
+# ---------------------------------------------------------
 model = ChatOpenAI(
     model="meta-llama/llama-3.3-70b-instruct",
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -51,124 +38,76 @@ model = ChatOpenAI(
 )
 
 # ---------------------------------------------------------
-# STEP 2: Tool Definitions
+# STEP 2: Tools (log tool invocations for observability)
 # ---------------------------------------------------------
-
 @tool
 def get_current_time() -> str:
-    """Return the current date and time as an ISO-formatted string.
-
-    Useful for timestamping responses or answering time-relative
-    questions (e.g. 'how long until my next dose?').
-    """
-    from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    """Return the current date and time as an ISO-formatted string."""
+    log("Tool invoked: get_current_time")
+    result = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log(f"get_current_time result: {result}")
+    return result
 
 @tool
 def safe_calculator(expression: str) -> str:
-    """Evaluate a basic numeric expression safely, without using eval().
-
-    Intended for dosage and unit calculations (e.g. mg/kg dosing,
-    tablet counts, unit conversions). Uses `numexpr`, which only
-    parses numeric math expressions and cannot execute arbitrary
-    Python code — this avoids the remote-code-execution risk that
-    a raw eval()-based calculator would introduce.
-
-    Example:
-        '25 * 4' -> 'Result: 100'
-
-    Args:
-        expression: A plain numeric expression (e.g. '5 * 70').
-
-    Returns:
-        A string containing the computed result, or an error message
-        if the expression could not be evaluated.
-    """
+    """Evaluate a basic numeric expression safely (for dosage and unit calculations)."""
+    log(f"Tool invoked: safe_calculator — expression={expression}")
     import numexpr
     try:
         result = numexpr.evaluate(expression).item()
+        log(f"safe_calculator result: {result}")
         return f"Result: {result}"
     except Exception as e:
+        log(f"safe_calculator error: {e}")
         return f"Error: {e}"
-
 
 @tool
 def web_search(query: str) -> str:
-    """Search the internet for up-to-date medical information.
-
-    Use this for anything that may not be in the model's training data
-    or requires current information — e.g. dosage guidelines, drug
-    interactions, recent recalls, or disease outbreak updates.
-
-    Powered by DuckDuckGo (free, no API key required).
-
-    Args:
-        query: The search query string.
-
-    Returns:
-        A string of search result snippets, or an error/fallback
-        message if the search fails or returns nothing.
-    """
+    """Search the internet for up-to-date medical information (via Tavily)."""
+    log(f"Tool invoked: web_search — query={query}")
     try:
-        search = DuckDuckGoSearchRun()
-        result = search.run(query)
-        print(f"🌐 Raw search result: {result[:300]}")  # debug — remove for production
-        return result if result else "No results found."
+        search = TavilySearch(max_results=3, api_key=os.getenv("TAVILY_API_KEY"))
+        result = search.invoke(query)
+        log(f"web_search returned result (length={len(str(result))} chars)")
+        return str(result)
     except Exception as e:
+        log(f"web_search error: {e}")
         return f"Search failed: {e}"
 
 
-# Register all tools available to the agent
 tools = [get_current_time, safe_calculator, web_search]
 
 # ---------------------------------------------------------
-# STEP 3: Persona / System Prompt
+# STEP 3: Persona
 # ---------------------------------------------------------
-# Defines the agent's role, scope, and behavioral guidelines — including
-# when to use which tool, when to defer to real healthcare professionals,
-# and when a query is out of scope entirely.
 PERSONA = """You are 'Dr. MedAssist', a professional medical-assistance AI.
 
-SCOPE: You help with medical-assistance queries only — symptoms, triage guidance,
-dosage/unit calculations, drug interactions, medication information, and general
-health education. You are NOT a general news or search assistant.
+SCOPE: Assist only with medical-assistance related queries such as symptoms,
+triage guidance, dosage and unit calculations, drug interactions, medication
+information, and general health education. Do not act as a general news or
+non-medical search assistant.
 
-- If a query is about general current events, statistics, or news that is NOT
-  directly medical-assistance related (e.g. general outbreak numbers, unrelated
-  news), politely note that this is outside your scope and point the user to an
-  authoritative source (e.g. WHO, NIH Pakistan, Ministry of Health) — do not
-  attempt to search for it yourself.
+- If a query concerns general current events or non-medical statistics, state
+    that it is outside the assistant's scope and refer the user to an authoritative
+    source (for example, WHO or NIH).
+- If current or verified medical information is required, use the `web_search`
+    tool and cite sources in the response.
+- For dosage, unit conversions, and numeric medical calculations, use the
+    `safe_calculator` tool rather than manual computation.
+- When appropriate, advise users to seek immediate medical attention and
+    defer diagnosis or prescribing to licensed healthcare professionals.
 
-- If a query IS medical-assistance related AND needs current/verified information
-  (e.g. current dosage guidelines, drug recalls, drug interactions, treatment
-  protocols), use the web_search tool to find it — do not say you lack real-time
-  access, since web_search gives you that access for exactly these cases.
-
-- For dosage, unit conversions, or numeric medical calculations, always use the
-  safe_calculator tool rather than computing manually.
-
-- Always cite the source when you use web_search (e.g. "According to [source]...").
-
-- When appropriate, advise the user to seek immediate medical attention and defer
-  to licensed healthcare professionals for diagnosis and treatment — you do not
-  diagnose or prescribe.
-
-Communicate clearly and compassionately in English.
+Communicate clearly, concisely, and compassionately in English.
 """
 
 # ---------------------------------------------------------
-# STEP 4: Conversation Memory (Checkpointing)
+# STEP 4: Memory
 # ---------------------------------------------------------
-# In-memory checkpoint saver — persists conversation state per thread_id
-# for the lifetime of the process. No external database required.
 memory = InMemorySaver()
 
 # ---------------------------------------------------------
-# STEP 5: Agent Assembly
+# STEP 5: Agent
 # ---------------------------------------------------------
-# Builds a ReAct-style agent that can reason about which tool to call,
-# call it, observe the result, and continue until it produces a final answer.
 agent = create_react_agent(
     model=model,
     tools=tools,
@@ -176,24 +115,10 @@ agent = create_react_agent(
     checkpointer=memory,
 )
 
-
 def chat(message: str, thread_id: str = "session-1") -> str:
-    """Send a single user message to the agent and return its reply.
-
-    Args:
-        message: The user's input message.
-        thread_id: Identifier for the conversation thread, allowing
-            multiple independent sessions to be tracked in parallel.
-
-    Returns:
-        The agent's final text response for this turn.
-    """
+    """Send a single user message to the agent and return its reply."""
     config = {
         "configurable": {"thread_id": thread_id},
-        # recursion_limit: max number of tool-call <-> reasoning iterations
-        # the agent can perform for a single query before it must stop.
-        # 8-10 is enough for multi-step tasks (e.g. search -> calculate)
-        # without letting a stuck loop run away.
         "recursion_limit": 10,
     }
     response = agent.invoke(
@@ -201,24 +126,137 @@ def chat(message: str, thread_id: str = "session-1") -> str:
         config=config,
     )
 
-    # Debug: show which tool(s), if any, the agent actually called this turn.
-    # Useful for verifying tool-trigger behavior during testing.
     for msg in response["messages"]:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
-                print(f"🔍 Tool called: {tc['name']} with args: {tc['args']}")
+                log(f"Agent performed internal tool call: {tc['name']} | args: {tc['args']}")
 
     return response["messages"][-1].content
 
+# ---------------------------------------------------------
+# STEP 6: MCP Server — same file mein, 5 tools expose kar rahe hain
+# ---------------------------------------------------------
+mcp_server = FastMCP("Dr-MedAssist")
+
+@mcp_server.tool()
+def ask_medassist(message: str, thread_id: str = "default-session") -> str:
+    """
+    Ask Dr. MedAssist a medical question. The agent will determine whether any
+    internal tools are required to form a response.
+
+    Args:
+        message: The user's medical question.
+        thread_id: Conversation thread ID.
+
+    Returns:
+        The agent's response, including citations if a web search was used.
+    """
+    log(f"[ask_medassist] Incoming request: {message!r}")
+    result = chat(message, thread_id=thread_id)
+    log(f"[ask_medassist] Sending response (length={len(result)} chars)")
+    return result
+
+@mcp_server.tool()
+def check_drug_interaction(drug_a: str, drug_b: str) -> str:
+    """
+    Assess potential interactions between two medications.
+
+    Args:
+        drug_a: Name of the first medication (e.g. 'ibuprofen').
+        drug_b: Name of the second medication (e.g. 'warfarin').
+
+    Returns:
+        A brief summary of any known interaction, its severity, and source
+        citations if available.
+    """
+    log(f"[check_drug_interaction] drugs={drug_a!r}, {drug_b!r}")
+    query = (
+        f"Is there a known drug interaction between {drug_a} and {drug_b}? "
+        f"Give severity (mild/moderate/severe) and a brief explanation, with source."
+    )
+    result = chat(query, thread_id=f"interaction-{drug_a}-{drug_b}")
+    log(f"[check_drug_interaction] Prepared response (length={len(result)} chars)")
+    return result
+
+@mcp_server.tool()
+def bmi_calculator(weight_kg: float, height_cm: float) -> str:
+    """
+    Calculate BMI from weight and height and return the BMI value and
+    corresponding category (Underweight / Normal / Overweight / Obese).
+
+    Args:
+        weight_kg: Weight in kilograms.
+        height_cm: Height in centimeters.
+
+    Returns:
+        A string containing the BMI value and category.
+    """
+    log(f"[bmi_calculator] weight={weight_kg} kg, height={height_cm} cm")
+    height_m = height_cm / 100
+    bmi = round(weight_kg / (height_m ** 2), 1)
+
+    if bmi < 18.5:
+        category = "Underweight"
+    elif bmi < 25:
+        category = "Normal weight"
+    elif bmi < 30:
+        category = "Overweight"
+    else:
+        category = "Obese"
+
+    result = f"BMI: {bmi} — Category: {category}"
+    log(f"[bmi_calculator] result: {result}")
+    return result
+
+@mcp_server.tool()
+def emergency_symptom_checker(symptoms: str) -> str:
+    """
+    Perform a concise triage assessment from a comma-separated list of
+    symptoms. This function provides a focused assessment indicating whether
+    the situation is an emergency, urgent, or non-urgent, and suggests
+    immediate next steps.
+
+    Args:
+        symptoms: Comma-separated symptoms (e.g. 'chest pain, shortness of breath').
+
+    Returns:
+        A short triage assessment and recommended next steps.
+    """
+    log(f"[emergency_symptom_checker] symptoms={symptoms!r}")
+    query = (
+        f"A person reports these symptoms: {symptoms}. "
+        f"Classify urgency as EMERGENCY, URGENT, or NON-URGENT, and give one-line next steps. "
+        f"Be direct and brief."
+    )
+    result = chat(query, thread_id=f"triage-{hash(symptoms) % 10000}")
+    log(f"[emergency_symptom_checker] Prepared response (length={len(result)} chars)")
+    return result
+
+@mcp_server.tool()
+def get_medassist_history(thread_id: str = "default-session") -> str:
+    """
+    Retrieve the full conversation history for a specific thread.
+
+    Args:
+        thread_id: The thread ID whose history is requested.
+
+    Returns:
+        The conversation history for the specified thread, with role labels.
+    """
+    log(f"[get_medassist_history] Request for history: thread={thread_id}")
+    config = {"configurable": {"thread_id": thread_id}}
+    state = agent.get_state(config)
+
+    if "messages" in state.values and state.values["messages"]:
+        return "\n".join(
+            f"[{msg.type}]: {msg.content}" for msg in state.values["messages"]
+        )
+    return "No conversation found for this thread."
 
 # ---------------------------------------------------------
-# STEP 6: Interactive CLI Loop
+# STEP 7: Entry point
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    print("Start conversation with Dr. MedAssist. Type 'exit' or 'quit' to stop.\n")
-    while True:
-        user_input = input("You: ").strip()
-        if user_input.lower() in ["exit", "quit"]:
-            break
-        reply = chat(user_input)
-        print(f"Dr. MedAssist: {reply}\n")
+    log("Dr. MedAssist MCP server starting...")
+    log("If this message is visible, the server has started successfully.")
+    mcp_server.run(transport="stdio")
