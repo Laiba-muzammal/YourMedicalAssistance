@@ -1,0 +1,267 @@
+"""
+Backup snapshot of LLM.py — created before modifications.
+"""
+
+"""
+Dr. MedAssist — MCP Server
+"""
+
+import os
+import sys
+import time
+from datetime import datetime
+from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_tavily import TavilySearch
+from mcp.server.fastmcp import FastMCP
+
+load_dotenv()
+
+# ---------------------------------------------------------
+# Logging helper — write diagnostics to stderr (stdout is reserved)
+# ---------------------------------------------------------
+def log(message: str) -> None:
+	timestamp = datetime.now().strftime("%H:%M:%S")
+	print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+# ---------------------------------------------------------
+# STEP 1: Model Setup
+# ---------------------------------------------------------
+model = ChatOpenAI(
+	model="meta-llama/llama-3.3-70b-instruct",
+	api_key=os.getenv("OPENROUTER_API_KEY"),
+	base_url="https://openrouter.ai/api/v1",
+	temperature=0.3,
+	max_tokens=500,
+	timeout=25,
+	max_retries=2,
+)
+
+# ---------------------------------------------------------
+# STEP 2: Tools (log tool invocations for observability)
+# ---------------------------------------------------------
+@tool
+def get_current_time() -> str:
+	"""Return the current date and time as an ISO-formatted string."""
+	log("Tool invoked: get_current_time")
+	result = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+	log(f"get_current_time result: {result}")
+	return result
+
+@tool
+def safe_calculator(expression: str) -> str:
+	"""Evaluate a basic numeric expression safely (for dosage and unit calculations)."""
+	log(f"Tool invoked: safe_calculator — expression={expression}")
+	import numexpr
+	try:
+		result = numexpr.evaluate(expression).item()
+		log(f"safe_calculator result: {result}")
+		return f"Result: {result}"
+	except Exception as e:
+		log(f"safe_calculator error: {e}")
+		return f"Error: {e}"
+
+@tool
+def web_search(query: str) -> str:
+	"""Search the internet for up-to-date medical information (via Tavily)."""
+	log(f"Tool invoked: web_search — query={query}")
+	try:
+		search = TavilySearch(max_results=3, api_key=os.getenv("TAVILY_API_KEY"))
+		result = search.invoke(query)
+		log(f"web_search returned result (length={len(str(result))} chars)")
+		return str(result)
+	except Exception as e:
+		log(f"web_search error: {e}")
+		return f"Search failed: {e}"
+
+
+tools = [get_current_time, safe_calculator, web_search]
+
+# ---------------------------------------------------------
+# STEP 3: Persona
+# ---------------------------------------------------------
+PERSONA = """You are 'Dr. MedAssist', a professional medical-assistance AI.
+
+SCOPE: Assist only with medical-assistance related queries such as symptoms,
+triage guidance, dosage and unit calculations, drug interactions, medication
+information, and general health education. Do not act as a general news or
+non-medical search assistant.
+
+- If a query concerns general current events or non-medical statistics, state
+  that it is outside the assistant's scope and refer the user to an authoritative
+  source (for example, WHO or NIH).
+- If current or verified medical information is required, use the `web_search`
+  tool and cite sources in the response.
+- For dosage, unit conversions, and numeric medical calculations, use the
+  `safe_calculator` tool rather than manual computation.
+- When appropriate, advise users to seek immediate medical attention and
+  defer diagnosis or prescribing to licensed healthcare professionals.
+
+Communicate clearly, concisely, and compassionately in English.
+"""
+
+# ---------------------------------------------------------
+# STEP 4: Memory
+# ---------------------------------------------------------
+memory = InMemorySaver()
+
+# ---------------------------------------------------------
+# STEP 5: Agent
+# ---------------------------------------------------------
+agent = create_react_agent(
+	model=model,
+	tools=tools,
+	prompt=PERSONA,
+	checkpointer=memory,
+)
+
+def chat(message: str, thread_id: str = "session-1") -> str:
+	"""Send a single user message to the agent and return its reply."""
+	config = {
+		"configurable": {"thread_id": thread_id},
+		"recursion_limit": 10,
+	}
+	response = agent.invoke(
+		{"messages": [{"role": "user", "content": message}]},
+		config=config,
+	)
+
+	for msg in response["messages"]:
+		if hasattr(msg, "tool_calls") and msg.tool_calls:
+			for tc in msg.tool_calls:
+				log(f"Agent performed internal tool call: {tc['name']} | args: {tc['args']}")
+
+	return response["messages"][-1].content
+
+# ---------------------------------------------------------
+# STEP 6: MCP Server — same file mein, 5 tools expose kar rahe hain
+# ---------------------------------------------------------
+mcp_server = FastMCP("Dr-MedAssist")
+
+@mcp_server.tool()
+def ask_medassist(message: str, thread_id: str = "default-session") -> str:
+	"""
+	Ask Dr. MedAssist a medical question. The agent will determine whether any
+	internal tools are required to form a response.
+
+	Args:
+		message: The user's medical question.
+		thread_id: Conversation thread ID.
+
+	Returns:
+		The agent's response, including citations if a web search was used.
+	"""
+	log(f"[ask_medassist] Incoming request: {message!r}")
+	result = chat(message, thread_id=thread_id)
+	log(f"[ask_medassist] Sending response (length={len(result)} chars)")
+	return result
+
+@mcp_server.tool()
+def check_drug_interaction(drug_a: str, drug_b: str) -> str:
+	"""
+	Assess potential interactions between two medications.
+
+	Args:
+		drug_a: Name of the first medication (e.g. 'ibuprofen').
+		drug_b: Name of the second medication (e.g. 'warfarin').
+
+	Returns:
+		A brief summary of any known interaction, its severity, and source
+		citations if available.
+	"""
+	log(f"[check_drug_interaction] drugs={drug_a!r}, {drug_b!r}")
+	query = (
+		f"Is there a known drug interaction between {drug_a} and {drug_b}? "
+		f"Give severity (mild/moderate/severe) and a brief explanation, with source."
+	)
+	result = chat(query, thread_id=f"interaction-{drug_a}-{drug_b}")
+	log(f"[check_drug_interaction] Prepared response (length={len(result)} chars)")
+	return result
+
+@mcp_server.tool()
+def bmi_calculator(weight_kg: float, height_cm: float) -> str:
+	"""
+	Calculate BMI from weight and height and return the BMI value and
+	corresponding category (Underweight / Normal / Overweight / Obese).
+
+	Args:
+		weight_kg: Weight in kilograms.
+		height_cm: Height in centimeters.
+
+	Returns:
+		A string containing the BMI value and category.
+	"""
+	log(f"[bmi_calculator] weight={weight_kg} kg, height={height_cm} cm")
+	height_m = height_cm / 100
+	bmi = round(weight_kg / (height_m ** 2), 1)
+
+	if bmi < 18.5:
+		category = "Underweight"
+	elif bmi < 25:
+		category = "Normal weight"
+	elif bmi < 30:
+		category = "Overweight"
+	else:
+		category = "Obese"
+
+	result = f"BMI: {bmi} — Category: {category}"
+	log(f"[bmi_calculator] result: {result}")
+	return result
+
+@mcp_server.tool()
+def emergency_symptom_checker(symptoms: str) -> str:
+	"""
+	Perform a concise triage assessment from a comma-separated list of
+	symptoms. This function provides a focused assessment indicating whether
+	the situation is an emergency, urgent, or non-urgent, and suggests
+	immediate next steps.
+
+	Args:
+		symptoms: Comma-separated symptoms (e.g. 'chest pain, shortness of breath').
+
+	Returns:
+		A short triage assessment and recommended next steps.
+	"""
+	log(f"[emergency_symptom_checker] symptoms={symptoms!r}")
+	query = (
+		f"A person reports these symptoms: {symptoms}. "
+		f"Classify urgency as EMERGENCY, URGENT, or NON-URGENT, and give one-line next steps. "
+		f"Be direct and brief."
+	)
+	result = chat(query, thread_id=f"triage-{hash(symptoms) % 10000}")
+	log(f"[emergency_symptom_checker] Prepared response (length={len(result)} chars)")
+	return result
+
+@mcp_server.tool()
+def get_medassist_history(thread_id: str = "default-session") -> str:
+	"""
+	Retrieve the full conversation history for a specific thread.
+
+	Args:
+		thread_id: The thread ID whose history is requested.
+
+	Returns:
+		The conversation history for the specified thread, with role labels.
+	"""
+	log(f"[get_medassist_history] Request for history: thread={thread_id}")
+	config = {"configurable": {"thread_id": thread_id}}
+	state = agent.get_state(config)
+
+	if "messages" in state.values and state.values["messages"]:
+		return "\n".join(
+			f"[{msg.type}]: {msg.content}" for msg in state.values["messages"]
+		)
+	return "No conversation found for this thread."
+
+# ---------------------------------------------------------
+# STEP 7: Entry point
+# ---------------------------------------------------------
+if __name__ == "__main__":
+	log("Dr. MedAssist MCP server starting...")
+	log("If this message is visible, the server has started successfully.")
+	mcp_server.run(transport="stdio")
+
