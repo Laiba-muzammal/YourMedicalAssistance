@@ -1,5 +1,5 @@
 """
-Dr. MedAssist — MCP Server
+Dr. MedAssist - MCP Server
 """
 
 import os
@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 # ---------------------------------------------------------
-# Logging helper — write diagnostics to stderr (stdout is reserved)
+# Logging helper - write diagnostics to stderr (stdout is reserved)
 # ---------------------------------------------------------
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -51,7 +51,7 @@ def get_current_time() -> str:
 @tool
 def safe_calculator(expression: str) -> str:
     """Evaluate a basic numeric expression safely (for dosage and unit calculations)."""
-    log(f"Tool invoked: safe_calculator — expression={expression}")
+    log(f"Tool invoked: safe_calculator - expression={expression}")
     import numexpr
     try:
         result = numexpr.evaluate(expression).item()
@@ -134,7 +134,7 @@ def chat(message: str, thread_id: str = "session-1") -> str:
     return response["messages"][-1].content
 
 # ---------------------------------------------------------
-# STEP 6: MCP Server — same file mein, 5 tools expose kar rahe hain
+# STEP 6: MCP Server - same file mein, 5 tools expose kar rahe hain
 # ---------------------------------------------------------
 mcp_server = FastMCP("Dr-MedAssist")
 
@@ -204,7 +204,7 @@ def bmi_calculator(weight_kg: float, height_cm: float) -> str:
     else:
         category = "Obese"
 
-    result = f"BMI: {bmi} — Category: {category}"
+    result = f"BMI: {bmi} - Category: {category}"
     log(f"[bmi_calculator] result: {result}")
     return result
 
