@@ -4,18 +4,30 @@ Dr. MedAssist - MCP Server
 
 import os
 import sys
-import time
+import asyncio
+
+# ---------------------------------------------------------
+# WINDOWS FIX: default asyncio event loop on Windows doesn't
+# handle stdio pipes reliably -> FastMCP stdio server hangs
+# after "initialize" and never responds. ProactorEventLoop
+# fixes this. Must be set before anything else touches asyncio.
+# ---------------------------------------------------------
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent  # FIX: create_react_agent moved here in LangGraph v1.0
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_tavily import TavilySearch
 from mcp.server.fastmcp import FastMCP
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 # ---------------------------------------------------------
 # Logging helper - write diagnostics to stderr (stdout is reserved)
@@ -23,6 +35,21 @@ load_dotenv()
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+
+def ensure_required_env() -> None:
+    missing = [
+        name
+        for name in ("OPENROUTER_API_KEY", "TAVILY_API_KEY")
+        if not os.getenv(name)
+    ]
+    if missing:
+        log(f"Missing required environment variables: {', '.join(missing)}")
+        raise RuntimeError("Required environment variables are missing")
+    log("Required environment variables loaded successfully")
+
+
+ensure_required_env()
 
 # ---------------------------------------------------------
 # STEP 1: Model Setup
@@ -108,10 +135,10 @@ memory = InMemorySaver()
 # ---------------------------------------------------------
 # STEP 5: Agent
 # ---------------------------------------------------------
-agent = create_react_agent(
+agent = create_agent(
     model=model,
     tools=tools,
-    prompt=PERSONA,
+    system_prompt=PERSONA,
     checkpointer=memory,
 )
 
