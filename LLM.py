@@ -18,10 +18,11 @@ if sys.platform == "win32":
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-
+from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain.agents import create_agent  # FIX: create_react_agent moved here in LangGraph v1.0
+from langchain.agents import create_agent  # LangGraph v1.0 / LangChain agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_tavily import TavilySearch
 from mcp.server.fastmcp import FastMCP
@@ -30,7 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 # ---------------------------------------------------------
-# Logging helper - write diagnostics to stderr (stdout is reserved)
+# Logging helper - write diagnostics to stderr (stdout is reserved for stdio MCP)
 # ---------------------------------------------------------
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -52,8 +53,23 @@ def ensure_required_env() -> None:
 ensure_required_env()
 
 # ---------------------------------------------------------
-# STEP 1: Model Setup
+# STEP 1: Vector Store & Model Setup
 # ---------------------------------------------------------
+log("Loading FastEmbed Model & Local FAISS Index...")
+embedding_model = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+INDEX_PATH = str(BASE_DIR / "faiss_mplus_health_topics")
+
+try:
+    vector_store = FAISS.load_local(
+        INDEX_PATH, 
+        embedding_model, 
+        allow_dangerous_deserialization=True
+    )
+    log(f"FAISS index loaded successfully from {INDEX_PATH}")
+except Exception as e:
+    log(f"FAISS loading failed: {e}")
+    vector_store = None
+
 model = ChatOpenAI(
     model="meta-llama/llama-3.3-70b-instruct",
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -65,7 +81,7 @@ model = ChatOpenAI(
 )
 
 # ---------------------------------------------------------
-# STEP 2: Tools (log tool invocations for observability)
+# STEP 2: Agent Tools Definitions
 # ---------------------------------------------------------
 @tool
 def get_current_time() -> str:
@@ -101,8 +117,68 @@ def web_search(query: str) -> str:
         log(f"web_search error: {e}")
         return f"Search failed: {e}"
 
+@tool
+def search_medical_knowledge(query: str, k: int = 2) -> str:
+    """
+    Searches FAISS vector store and returns complete vector pipeline steps:
+    Query Vector, Raw DB Docs, Embeddings, Similarity Scores, and Top-K Matches.
+    """
+    if vector_store is None:
+        return "Medical Knowledge Base index is not available."
 
-tools = [get_current_time, safe_calculator, web_search]
+    try:
+        # 1. Generate Query Vector Embedding
+        query_embedding = embedding_model.embed_query(query)
+        query_vector_sample = [round(float(val), 4) for val in query_embedding[:8]]
+        
+        # 2. Perform Cosine Similarity / Distance Search in FAISS
+        # Returns list of tuples: (Document, Score)
+        results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+        
+        if not results_with_scores:
+            return "No matching medical records found in knowledge base."
+
+        pipeline_output = []
+        pipeline_output.append("=== ⚙️ INTERNAL RAG VECTOR PIPELINE EXECUTION ===\n")
+        
+        # PIPELINE STEP 1: INPUT & EMBEDDING
+        pipeline_output.append(f"1️⃣ USER INPUT QUERY: '{query}'")
+        pipeline_output.append(
+            f"   └─► Query Vector Embedding (Dim={len(query_embedding)}, Sample First 8 Dimensions): {query_vector_sample}...\n"
+        )
+        
+        # PIPELINE STEP 2 & 3: COSINE SIMILARITY & TOP-K RETRIEVAL
+        pipeline_output.append(f"2️⃣ FAISS VECTOR MATCHING & COSINE SIMILARITY (Top-{k} Matches):")
+        
+        for idx, (doc, score) in enumerate(results_with_scores, 1):
+            condition = doc.metadata.get("condition", "N/A")
+            source = doc.metadata.get("source", "MedlinePlus")
+            content_snippet = doc.page_content.replace("\n", " ")[:150]
+            
+            # Retrieve embedding sample for the stored document
+            doc_embedding = embedding_model.embed_query(doc.page_content)
+            doc_vector_sample = [round(float(val), 4) for val in doc_embedding[:8]]
+            
+            doc_block = (
+                f"\n   --- [TOP-{idx} RETRIEVED DOCUMENT] ---\n"
+                f"   • Condition/Focus: {condition}\n"
+                f"   • Source Database: {source}\n"
+                f"   • Vector Distance/Score: {score:.4f} (Lower = Higher Similarity)\n"
+                f"   • Stored Doc Vector Sample: {doc_vector_sample}...\n"
+                f"   • Raw Content Snippet:\n     \"{content_snippet}...\""
+            )
+            pipeline_output.append(doc_block)
+
+        final_text = "\n".join(pipeline_output)
+        
+        # Terminal Log Output
+        log(f"[RAG PIPELINE] Executed query '{query}' | Top-{k} Scores: {[round(s,4) for _, s in results_with_scores]}")        
+        return final_text
+
+    except Exception as e:
+        return f"Error executing FAISS similarity search pipeline: {str(e)}"
+# Registering Tools for Agent
+tools = [get_current_time, search_medical_knowledge, safe_calculator, web_search]
 
 # ---------------------------------------------------------
 # STEP 3: Persona
@@ -114,27 +190,27 @@ triage guidance, dosage and unit calculations, drug interactions, medication
 information, and general health education. Do not act as a general news or
 non-medical search assistant.
 
-- If a query concerns general current events or non-medical statistics, state
-    that it is outside the assistant's scope and refer the user to an authoritative
-    source (for example, WHO or NIH).
-- If current or verified medical information is required, use the `web_search`
-    tool and cite sources in the response.
-- For dosage, unit conversions, and numeric medical calculations, use the
-    `safe_calculator` tool rather than manual computation.
-- When appropriate, advise users to seek immediate medical attention and
-    defer diagnosis or prescribing to licensed healthcare professionals.
+- ALWAYS use the `search_medical_knowledge` tool FIRST whenever the user asks about medical topics, symptoms, health conditions, or treatments.
+- If current or verified external medical information is required and not found in local DB, use the `web_search` tool and cite sources in the response.
+- If a query concerns general non-medical events, state that it is outside the scope.
+- For dosage, unit conversions, and numeric medical calculations, use the `safe_calculator` tool rather than manual computation.
+- When appropriate, advise users to seek immediate medical attention and defer diagnosis or prescribing to licensed healthcare professionals.
+- Always prioritize patient safety and well-being in all interactions.
+
+STRICT TOOL USAGE RULES:
+1. ALWAYS call `search_medical_knowledge` FIRST for any user query related to health, medical conditions, symptoms, or search requests.
+2. Even if the user query is slightly unclear or contains typos (e.g. "FIASS", "ALT USE"), extract the core medical/search keywords and execute the `search_medical_knowledge` tool.
+3. IN YOUR FINAL RESPONSE: You MUST start or end your response with a clear badge showing which tools were executed, like this:
+   `[Tool Used: search_medical_knowledge]` or `[Tool Used: None / Direct Answer]
 
 Communicate clearly, concisely, and compassionately in English.
 """
 
 # ---------------------------------------------------------
-# STEP 4: Memory
+# STEP 4: Memory & Agent Initialization
 # ---------------------------------------------------------
 memory = InMemorySaver()
 
-# ---------------------------------------------------------
-# STEP 5: Agent
-# ---------------------------------------------------------
 agent = create_agent(
     model=model,
     tools=tools,
@@ -161,23 +237,13 @@ def chat(message: str, thread_id: str = "session-1") -> str:
     return response["messages"][-1].content
 
 # ---------------------------------------------------------
-# STEP 6: MCP Server - same file mein, 5 tools expose kar rahe hain
+# STEP 5: FastMCP Server Definitions
 # ---------------------------------------------------------
 mcp_server = FastMCP("Dr-MedAssist")
 
 @mcp_server.tool()
 def ask_medassist(message: str, thread_id: str = "default-session") -> str:
-    """
-    Ask Dr. MedAssist a medical question. The agent will determine whether any
-    internal tools are required to form a response.
-
-    Args:
-        message: The user's medical question.
-        thread_id: Conversation thread ID.
-
-    Returns:
-        The agent's response, including citations if a web search was used.
-    """
+    """Ask Dr. MedAssist a medical question."""
     log(f"[ask_medassist] Incoming request: {message!r}")
     result = chat(message, thread_id=thread_id)
     log(f"[ask_medassist] Sending response (length={len(result)} chars)")
@@ -185,17 +251,7 @@ def ask_medassist(message: str, thread_id: str = "default-session") -> str:
 
 @mcp_server.tool()
 def check_drug_interaction(drug_a: str, drug_b: str) -> str:
-    """
-    Assess potential interactions between two medications.
-
-    Args:
-        drug_a: Name of the first medication (e.g. 'ibuprofen').
-        drug_b: Name of the second medication (e.g. 'warfarin').
-
-    Returns:
-        A brief summary of any known interaction, its severity, and source
-        citations if available.
-    """
+    """Assess potential interactions between two medications."""
     log(f"[check_drug_interaction] drugs={drug_a!r}, {drug_b!r}")
     query = (
         f"Is there a known drug interaction between {drug_a} and {drug_b}? "
@@ -207,17 +263,7 @@ def check_drug_interaction(drug_a: str, drug_b: str) -> str:
 
 @mcp_server.tool()
 def bmi_calculator(weight_kg: float, height_cm: float) -> str:
-    """
-    Calculate BMI from weight and height and return the BMI value and
-    corresponding category (Underweight / Normal / Overweight / Obese).
-
-    Args:
-        weight_kg: Weight in kilograms.
-        height_cm: Height in centimeters.
-
-    Returns:
-        A string containing the BMI value and category.
-    """
+    """Calculate BMI from weight and height."""
     log(f"[bmi_calculator] weight={weight_kg} kg, height={height_cm} cm")
     height_m = height_cm / 100
     bmi = round(weight_kg / (height_m ** 2), 1)
@@ -237,18 +283,7 @@ def bmi_calculator(weight_kg: float, height_cm: float) -> str:
 
 @mcp_server.tool()
 def emergency_symptom_checker(symptoms: str) -> str:
-    """
-    Perform a concise triage assessment from a comma-separated list of
-    symptoms. This function provides a focused assessment indicating whether
-    the situation is an emergency, urgent, or non-urgent, and suggests
-    immediate next steps.
-
-    Args:
-        symptoms: Comma-separated symptoms (e.g. 'chest pain, shortness of breath').
-
-    Returns:
-        A short triage assessment and recommended next steps.
-    """
+    """Perform a concise triage assessment from symptoms."""
     log(f"[emergency_symptom_checker] symptoms={symptoms!r}")
     query = (
         f"A person reports these symptoms: {symptoms}. "
@@ -261,15 +296,7 @@ def emergency_symptom_checker(symptoms: str) -> str:
 
 @mcp_server.tool()
 def get_medassist_history(thread_id: str = "default-session") -> str:
-    """
-    Retrieve the full conversation history for a specific thread.
-
-    Args:
-        thread_id: The thread ID whose history is requested.
-
-    Returns:
-        The conversation history for the specified thread, with role labels.
-    """
+    """Retrieve the full conversation history for a specific thread."""
     log(f"[get_medassist_history] Request for history: thread={thread_id}")
     config = {"configurable": {"thread_id": thread_id}}
     state = agent.get_state(config)
@@ -280,10 +307,14 @@ def get_medassist_history(thread_id: str = "default-session") -> str:
         )
     return "No conversation found for this thread."
 
+@mcp_server.tool()
+def search_medical_db_mcp(query: str) -> str:
+    """Direct MCP endpoint to query MedlinePlus/MedQuAD vector database."""
+    return search_medical_knowledge.invoke({"query": query})
+
 # ---------------------------------------------------------
-# STEP 7: Entry point
+# STEP 6: Entry point
 # ---------------------------------------------------------
 if __name__ == "__main__":
     log("Dr. MedAssist MCP server starting...")
-    log("If this message is visible, the server has started successfully.")
     mcp_server.run(transport="stdio")

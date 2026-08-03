@@ -1,6 +1,19 @@
-# Local environment variables containing API keys
+# Generated vector DB (regenerate via build_vector_db.py)
+faiss_mplus_health_topics/
+faiss_medical_index/
+
+# Generated knowledge base JSON (regenerate via parser_data.py)
+*_knowledge_base*.json
+
+# Secrets
 .env
 
-# Python cache files
+# Backups
+backups/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Raw dataset (huge, regenerate via: git clone https://github.com/abachaa/MedQuAD.git)
+MedQuAD/
