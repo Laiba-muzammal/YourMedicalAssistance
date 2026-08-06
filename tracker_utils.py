@@ -17,6 +17,7 @@ import os
 import re
 import smtplib
 import sys
+import json
 import time
 from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
@@ -113,8 +114,6 @@ def is_real_product_page(page_text: str, url: str) -> tuple[bool, str]:
 
     return True, ""
 
-import json
-
 def check_availability(url: str, medicine_name: str, timeout: int = 15) -> tuple[bool, str]:
     try:
         html = _fetch_rendered_html(url, timeout_ms=timeout * 1000)
@@ -162,7 +161,7 @@ def check_availability(url: str, medicine_name: str, timeout: int = 15) -> tuple
     if has_positive:
         return True, f"Found '{medicine_name}' - item is Available (Add to Cart / In Stock detected)."
     return False, f"Found '{medicine_name}' but no clear availability signal."
-       
+
 def send_email(to_email: str, subject: str, body: str) -> None:
     """
     Send a plain-text email via Gmail SMTP using an App Password
