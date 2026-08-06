@@ -101,10 +101,13 @@ Create a `.env` file in the project root:
 ```
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 TAVILY_API_KEY=your_tavily_api_key_here
+EMAIL_SENDER=your_gmail_address@gmail.com
+EMAIL_APP_PASSWORD=your_16_character_gmail_app_password
 ```
 
 - Get a free OpenRouter key at [openrouter.ai](https://openrouter.ai/).
 - Get a free Tavily key at [tavily.com](https://tavily.com/).
+- For Gmail sending, enable 2-step verification and create a Gmail App Password; regular Gmail passwords will fail.
 
 ### 5. Build the medical knowledge base (one-time setup)
 

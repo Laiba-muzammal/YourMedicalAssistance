@@ -4,6 +4,7 @@ Dr. MedAssist - MCP Server
 
 import os
 import sys
+import re
 import asyncio
 
 # ---------------------------------------------------------
@@ -26,6 +27,9 @@ from langchain.agents import create_agent  # LangGraph v1.0 / LangChain agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_tavily import TavilySearch
 from mcp.server.fastmcp import FastMCP
+
+from tracker_db import init_db
+from tracker_graph import run_immediate_check
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -51,6 +55,7 @@ def ensure_required_env() -> None:
 
 
 ensure_required_env()
+init_db()
 
 # ---------------------------------------------------------
 # STEP 1: Vector Store & Model Setup
@@ -61,8 +66,8 @@ INDEX_PATH = str(BASE_DIR / "faiss_mplus_health_topics")
 
 try:
     vector_store = FAISS.load_local(
-        INDEX_PATH, 
-        embedding_model, 
+        INDEX_PATH,
+        embedding_model,
         allow_dangerous_deserialization=True
     )
     log(f"FAISS index loaded successfully from {INDEX_PATH}")
@@ -127,38 +132,32 @@ def search_medical_knowledge(query: str, k: int = 2) -> str:
         return "Medical Knowledge Base index is not available."
 
     try:
-        # 1. Generate Query Vector Embedding
         query_embedding = embedding_model.embed_query(query)
         query_vector_sample = [round(float(val), 4) for val in query_embedding[:8]]
-        
-        # 2. Perform Cosine Similarity / Distance Search in FAISS
-        # Returns list of tuples: (Document, Score)
+
         results_with_scores = vector_store.similarity_search_with_score(query, k=k)
-        
+
         if not results_with_scores:
             return "No matching medical records found in knowledge base."
 
         pipeline_output = []
         pipeline_output.append("=== ⚙️ INTERNAL RAG VECTOR PIPELINE EXECUTION ===\n")
-        
-        # PIPELINE STEP 1: INPUT & EMBEDDING
+
         pipeline_output.append(f"1️⃣ USER INPUT QUERY: '{query}'")
         pipeline_output.append(
             f"   └─► Query Vector Embedding (Dim={len(query_embedding)}, Sample First 8 Dimensions): {query_vector_sample}...\n"
         )
-        
-        # PIPELINE STEP 2 & 3: COSINE SIMILARITY & TOP-K RETRIEVAL
+
         pipeline_output.append(f"2️⃣ FAISS VECTOR MATCHING & COSINE SIMILARITY (Top-{k} Matches):")
-        
+
         for idx, (doc, score) in enumerate(results_with_scores, 1):
             condition = doc.metadata.get("condition", "N/A")
             source = doc.metadata.get("source", "MedlinePlus")
             content_snippet = doc.page_content.replace("\n", " ")[:150]
-            
-            # Retrieve embedding sample for the stored document
+
             doc_embedding = embedding_model.embed_query(doc.page_content)
             doc_vector_sample = [round(float(val), 4) for val in doc_embedding[:8]]
-            
+
             doc_block = (
                 f"\n   --- [TOP-{idx} RETRIEVED DOCUMENT] ---\n"
                 f"   • Condition/Focus: {condition}\n"
@@ -170,15 +169,90 @@ def search_medical_knowledge(query: str, k: int = 2) -> str:
             pipeline_output.append(doc_block)
 
         final_text = "\n".join(pipeline_output)
-        
-        # Terminal Log Output
-        log(f"[RAG PIPELINE] Executed query '{query}' | Top-{k} Scores: {[round(s,4) for _, s in results_with_scores]}")        
+
+        log(f"[RAG PIPELINE] Executed query '{query}' | Top-{k} Scores: {[round(s,4) for _, s in results_with_scores]}")
         return final_text
 
     except Exception as e:
         return f"Error executing FAISS similarity search pipeline: {str(e)}"
-# Registering Tools for Agent
-tools = [get_current_time, search_medical_knowledge, safe_calculator, web_search]
+
+
+def extract_first_url(search_result_str: str) -> str | None:
+    """Helper: text mein se pehla valid HTTP/HTTPS URL extract karta hai."""
+    urls = re.findall(r'https?://[^\s\'"\]\)]+', str(search_result_str))
+    return urls[0] if urls else None
+
+@tool
+def track_medicine_availability(medicine_name: str, url: str, recipient_email: str) -> str:
+    '''
+    Check if a medicine is available at a given website/pharmacy right now.
+    If given a pharmacy name instead of a direct URL, it automatically finds the product link first.
+    If a direct URL is given but turns out invalid/unverifiable, falls back to web search
+    to find the real product page before giving up.
+    '''
+    med_clean = medicine_name.strip()
+    target_input = url.strip()
+    email_clean = recipient_email.strip()
+
+    log(f"Tool invoked: track_medicine_availability - medicine={med_clean}, url_or_target={target_input}")
+
+    def resolve_via_search(hint: str) -> str | None:
+        domain_hint = f"{hint}.pk" if "." not in hint else hint
+        search_query = f"site:{domain_hint} {med_clean} buy online"
+        try:
+            search_output = web_search.invoke(search_query)
+            found = extract_first_url(search_output)
+            if found:
+                log(f"Auto-resolved product URL via search: {found}")
+            return found
+        except Exception as e:
+            log(f"Search fallback failed: {e}")
+            return None
+
+    # Step 1: Resolve initial URL candidate
+    if target_input.startswith("http://") or target_input.startswith("https://"):
+        target_url = target_input
+        came_from_direct_guess = True
+    else:
+        target_url = resolve_via_search(target_input)
+        came_from_direct_guess = False
+        if not target_url:
+            return (
+                f"Could not automatically find a direct product page for '{med_clean}' "
+                f"on '{target_input}'. Please provide a direct product link."
+            )
+
+    # Step 2: Run the check. If a direct/guessed URL fails or looks invalid,
+    # don't trust it — fall back to search instead of reporting a false negative.
+    try:
+        result_message = run_immediate_check(med_clean, target_url, email_clean)
+    except Exception as e:
+        result_message = f"__ERROR__: {e}"
+
+    needs_fallback = came_from_direct_guess and (
+        result_message.startswith("__ERROR__")
+        or "isn't available" in result_message  # direct guess reported not-available; unverified
+    )
+
+    if needs_fallback:
+        # Extract a domain hint from the original URL to search within
+        domain_hint = re.sub(r"^https?://", "", target_input).split("/")[0]
+        fallback_url = resolve_via_search(domain_hint)
+        if fallback_url and fallback_url != target_url:
+            log(f"Direct URL guess unreliable, retrying with searched URL: {fallback_url}")
+            try:
+                result_message = run_immediate_check(med_clean, fallback_url, email_clean)
+            except Exception as e:
+                log(f"Fallback check also failed: {e}")
+                return f"Couldn't verify availability reliably ({e}). Please double-check the URL."
+
+    if result_message.startswith("__ERROR__"):
+        return f"Couldn't complete the check right now ({result_message.replace('__ERROR__: ', '')}). Please check the URL/Pharmacy name and try again."
+
+    log(f"track_medicine_availability: final result -> {result_message}")
+    return result_message
+    
+tools = [get_current_time, safe_calculator, web_search, track_medicine_availability]
 
 # ---------------------------------------------------------
 # STEP 3: Persona
@@ -196,12 +270,21 @@ non-medical search assistant.
 - For dosage, unit conversions, and numeric medical calculations, use the `safe_calculator` tool rather than manual computation.
 - When appropriate, advise users to seek immediate medical attention and defer diagnosis or prescribing to licensed healthcare professionals.
 - Always prioritize patient safety and well-being in all interactions.
+- If the user wants to check or track whether a specific medicine is available
+    at a website, use the `track_medicine_availability` tool. If it's not found,
+    inform the user that tracking has started and they'll be notified by email.
 
 STRICT TOOL USAGE RULES:
 1. ALWAYS call `search_medical_knowledge` FIRST for any user query related to health, medical conditions, symptoms, or search requests.
 2. Even if the user query is slightly unclear or contains typos (e.g. "FIASS", "ALT USE"), extract the core medical/search keywords and execute the `search_medical_knowledge` tool.
 3. IN YOUR FINAL RESPONSE: You MUST start or end your response with a clear badge showing which tools were executed, like this:
-   `[Tool Used: search_medical_knowledge]` or `[Tool Used: None / Direct Answer]
+   `[Tool Used: search_medical_knowledge]` or `[Tool Used: None / Direct Answer]`
+
+TRACKING INSTRUCTIONS:
+- If the user asks to check or track medicine availability:
+  1. Check if both a specific website URL and an Email Address are provided in the prompt.
+  2. IF EITHER IS MISSING: Do NOT invoke `track_medicine_availability`. Ask the user directly to provide the missing website URL or Email Address first.
+  3. ONLY call `track_medicine_availability` once you have: medicine_name, exact website URL, and recipient email.
 
 Communicate clearly, concisely, and compassionately in English.
 """
@@ -311,6 +394,20 @@ def get_medassist_history(thread_id: str = "default-session") -> str:
 def search_medical_db_mcp(query: str) -> str:
     """Direct MCP endpoint to query MedlinePlus/MedQuAD vector database."""
     return search_medical_knowledge.invoke({"query": query})
+
+@mcp_server.tool()
+def track_medicine_mcp(medicine_name: str, url: str, recipient_email: str) -> str:
+    """
+    Check medicine availability on a pharmacy URL.
+    If available, alerts immediately.
+    If not, starts background tracking and sends email alerts.
+    """
+    log(f"[track_medicine_mcp] Called for {medicine_name} at {url}")
+    return track_medicine_availability.invoke({
+        "medicine_name": medicine_name,
+        "url": url,
+        "recipient_email": recipient_email
+    })
 
 # ---------------------------------------------------------
 # STEP 6: Entry point
