@@ -69,11 +69,12 @@ def mark_found(record_id: int):
 
 
 def record_check_attempt(record_id: int, error: str | None = None):
-    """
-    Log that a check happened (successful or not).
-    Wajah: fault tolerance - agar website check fail ho (network error etc),
-    hum silently skip nahi karte, error ko store karte hain taake debug kar sakein,
-    aur record 'pending' hi rehta hai - agla scheduled run phir try karega.
+    """Record that a check attempt occurred and optionally save an error.
+
+    This function increments the `check_attempts` counter and updates
+    `last_checked_at`. If the check failed, the textual error is stored in
+    `last_error` so operators can inspect failures. Records remain in the
+    'pending' state to allow scheduled rechecks.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -85,9 +86,11 @@ def record_check_attempt(record_id: int, error: str | None = None):
 
 
 def should_send_reminder(record: dict) -> bool:
-    """
-    True agar last reminder (ya creation, agar koi reminder abhi tak nahi bheja)
-    ko 12+ hours ho chuke hain.
+    """Return True when a reminder should be sent for the given record.
+
+    A reminder is due if at least 12 hours have passed since the last
+    reminder was sent, or since record creation if no reminder has been sent
+    yet.
     """
     reference_time_str = record["last_reminder_at"] or record["created_at"]
     reference_time = datetime.fromisoformat(reference_time_str)
@@ -95,6 +98,7 @@ def should_send_reminder(record: dict) -> bool:
 
 
 def mark_reminder_sent(record_id: int):
+    """Update the record to indicate that a reminder email was sent now."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "UPDATE medicine_tracking SET last_reminder_at = ? WHERE id = ?",

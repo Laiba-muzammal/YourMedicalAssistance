@@ -178,7 +178,10 @@ def search_medical_knowledge(query: str, k: int = 2) -> str:
 
 
 def extract_first_url(search_result_str: str) -> str | None:
-    """Helper: text mein se pehla valid HTTP/HTTPS URL extract karta hai."""
+    """Extract the first HTTP/HTTPS URL from the given text.
+
+    Returns the URL string if found, otherwise returns `None`.
+    """
     urls = re.findall(r'https?://[^\s\'"\]\)]+', str(search_result_str))
     return urls[0] if urls else None
 
@@ -212,10 +215,10 @@ def track_medicine_availability(medicine_name: str, url: str, recipient_email: s
     # Step 1: Resolve initial URL candidate
     if target_input.startswith("http://") or target_input.startswith("https://"):
         target_url = target_input
-        came_from_direct_guess = True
+        is_user_provided_url = True    
     else:
         target_url = resolve_via_search(target_input)
-        came_from_direct_guess = False
+        is_user_provided_url = False    
         if not target_url:
             return (
                 f"Could not automatically find a direct product page for '{med_clean}' "
@@ -229,9 +232,9 @@ def track_medicine_availability(medicine_name: str, url: str, recipient_email: s
     except Exception as e:
         result_message = f"__ERROR__: {e}"
 
-    needs_fallback = came_from_direct_guess and (
+    needs_fallback = (not is_user_provided_url) and (
         result_message.startswith("__ERROR__")
-        or "isn't available" in result_message  # direct guess reported not-available; unverified
+        or "isn't available" in result_message
     )
 
     if needs_fallback:

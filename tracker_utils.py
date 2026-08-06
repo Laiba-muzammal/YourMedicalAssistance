@@ -30,15 +30,21 @@ load_dotenv(BASE_DIR / ".env")
 
 
 def extract_first_url(search_result_str: str) -> str | None:
-    """Helper: Text/Search payload se pehla valid HTTPS/HTTP URL extract karta hai."""
+    """Extract the first HTTP/HTTPS URL from arbitrary text.
+
+    Returns the URL string if found, otherwise `None`.
+    """
     urls = re.findall(r'https?://[^\s\'"\]\)]+', str(search_result_str))
     return urls[0] if urls else None
 
 
 def resolve_product_url(medicine_name: str, url_or_pharmacy: str, web_search_tool=None) -> str:
-    """
-    Agar user ne direct URL diya hai to wahi use karta hai.
-    Agar homepage ya site name (e.g., 'dwatson') diya hai, to Web Search se direct PDP link fetch karta hai.
+    """Resolve a user-provided pharmacy identifier to a viable product URL.
+
+    If the user supplies a full product URL, it is returned unchanged. If they
+    provide a site name or homepage, this function attempts to resolve a direct
+    product page (PDP) link using the optional `web_search_tool`. As a last
+    resort it formats the input as a plausible HTTPS hostname.
     """
     target = url_or_pharmacy.strip()
 
